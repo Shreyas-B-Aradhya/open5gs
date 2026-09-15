@@ -1418,7 +1418,7 @@ void s1ap_handle_initial_context_setup_response(
                         mme_ue->imsi_bcd, pending_bearer->ebi);
 
                 r = nas_eps_send_deactivate_bearer_context_request(
-                        pending_bearer);
+                        pending_bearer, mme_ue->paging.esm_cause);
                 if (r != OGS_OK)
                     ogs_error("[%s] Failed to retry bearer deactivation "
                             "[EBI:%d]", mme_ue->imsi_bcd,
