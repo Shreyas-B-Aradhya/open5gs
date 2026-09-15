@@ -70,13 +70,16 @@ static void recalculate_pool_size(void)
 
 #define POOL_NUM_PER_UE 16
     ogs_app()->pool.timer = global_conf.max.ue * POOL_NUM_PER_UE;
-    ogs_app()->pool.message = global_conf.max.ue * POOL_NUM_PER_UE;
     ogs_app()->pool.event = global_conf.max.ue * POOL_NUM_PER_UE;
     ogs_app()->pool.socket = global_conf.max.ue * POOL_NUM_PER_UE;
     ogs_app()->pool.xact = global_conf.max.ue * POOL_NUM_PER_UE;
     ogs_app()->pool.stream = global_conf.max.ue * POOL_NUM_PER_UE;
 
     ogs_app()->pool.nf = global_conf.max.peer;
+
+    /* Size both SBI message pools for incoming requests and transactions. */
+    ogs_app()->pool.message = ogs_app()->pool.event + ogs_app()->pool.xact;
+
 #define NF_SERVICE_PER_NF_INSTANCE 16
     ogs_app()->pool.nf_service =
         ogs_app()->pool.nf * NF_SERVICE_PER_NF_INSTANCE;
@@ -255,6 +258,12 @@ int ogs_app_parse_global_conf(ogs_yaml_iter_t *parent)
                         ogs_yaml_iter_bool(&parameter_iter);
                 } else if (!strcmp(parameter_key, "fake_csfb")) {
                     global_conf.parameter.fake_csfb =
+                        ogs_yaml_iter_bool(&parameter_iter);
+                } else if (!strcmp(parameter_key, "no_ims")) {
+                    global_conf.parameter.no_ims =
+                        ogs_yaml_iter_bool(&parameter_iter);
+                } else if (!strcmp(parameter_key, "allow_unsecured_redirection")) {
+                    global_conf.parameter.allow_unsecured_redirection =
                         ogs_yaml_iter_bool(&parameter_iter);
                 } else if (!strcmp(parameter_key,
                             "no_ipv4v6_local_addr_in_packet_filter")) {

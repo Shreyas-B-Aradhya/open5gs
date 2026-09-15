@@ -40,6 +40,15 @@ typedef struct amf_sbi_xact_ctx_s {
      * may change before the asynchronous response arrives.
      */
     ogs_pool_id_t ran_ue_id;
+
+    /*
+     * Snapshot of the target RAN-UE identifier for handover cancel.
+     *
+     * The source RAN-UE context can be removed before the asynchronous
+     * Update SM Context response arrives. Keep the target identifier in
+     * the SBI transaction so the target context can still be released.
+     */
+    ogs_pool_id_t target_ue_id;
 } amf_sbi_xact_ctx_t;
 
 int amf_sbi_open(void);
@@ -68,6 +77,7 @@ bool amf_sbi_send_request(
 #define AMF_UPDATE_SM_CONTEXT_HANDOVER_REQ_ACK          22
 #define AMF_UPDATE_SM_CONTEXT_HANDOVER_NOTIFY           23
 #define AMF_UPDATE_SM_CONTEXT_HANDOVER_CANCEL           24
+#define AMF_UPDATE_SM_CONTEXT_STALE_USER_PLANE          25
 #define AMF_RELEASE_SM_CONTEXT_NO_STATE                 31
 #define AMF_RELEASE_SM_CONTEXT_REGISTRATION_ACCEPT      33
 #define AMF_RELEASE_SM_CONTEXT_SERVICE_ACCEPT           34
@@ -85,19 +95,19 @@ bool amf_sbi_send_request(
 #define AMF_SMF_SELECTION_IN_HPLMN_IN_HOME_ROUTED           3
 
 int amf_ue_sbi_discover_and_send(
-        ogs_sbi_service_type_e service_type,
+        OpenAPI_service_name_e service_name,
         ogs_sbi_discovery_option_t *discovery_option,
         ogs_sbi_request_t *(*build)(amf_ue_t *amf_ue, void *data),
         amf_ue_t *amf_ue, int state, void *data);
 int amf_sess_sbi_discover_and_send(
-        ogs_sbi_service_type_e service_type,
+        OpenAPI_service_name_e service_name,
         ogs_sbi_discovery_option_t *discovery_option,
         ogs_sbi_request_t *(*build)(amf_sess_t *sess, void *data),
         ran_ue_t *ran_ue, amf_sess_t *sess, int state, void *data);
 
 int amf_sess_sbi_discover_by_nsi(
         ran_ue_t *ran_ue, amf_sess_t *sess,
-        ogs_sbi_service_type_e service_type,
+        OpenAPI_service_name_e service_name,
         ogs_sbi_discovery_option_t *discovery_option, int state);
 
 void amf_sbi_send_activating_session(
@@ -108,6 +118,9 @@ void amf_sbi_send_deactivate_session(
 void amf_sbi_send_deactivate_all_sessions(
         ran_ue_t *ran_ue, amf_ue_t *amf_ue, int state, int group, int cause);
 void amf_sbi_send_deactivate_all_ue_in_gnb(amf_gnb_t *gnb, int state);
+
+/* Clean up after an NG context that was removed while held */
+void amf_sbi_send_deactivate_stale_user_plane(ran_ue_t *ran_ue);
 
 void amf_sbi_send_release_session(
         ran_ue_t *ran_ue, amf_sess_t *sess, int state, void *data);
