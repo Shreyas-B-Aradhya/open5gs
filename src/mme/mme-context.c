@@ -3646,6 +3646,37 @@ static mme_sgw_t *changed_sgw_node(mme_sgw_t *current, enb_ue_t *enb_ue)
     return NULL;
 }
 
+/*
+ * mme_ue_reselect_sgw()
+ *
+ * SGW-C load-balancing across reattaches.
+ *
+ * mme_ue_add() below picks an SGW via selected_sgw_node() exactly once,
+ * the first time a brand-new mme_ue_t is created. If a subsequent Attach
+ * Request for the same subscriber is served by an mme_ue_t that is still
+ * alive (found via mme_ue_find_by_message() in mme-sm.c, i.e. "Known UE
+ * by GUTI"), that path never revisits SGW selection at all, so the
+ * subscriber stays pinned to whichever SGW it got on its very first
+ * attach forever - defeating round-robin load balancing on reattach.
+ *
+ * This helper lets mme-sm.c force a fresh round-robin pick in exactly
+ * that situation. It advances the same global mme_self()->sgw iterator
+ * used by mme_ue_add(), so it must only be called when it is safe to
+ * move the subscriber to a different SGW (i.e. no session/bearer is
+ * still bound to the old one - see the caller in mme-sm.c).
+ */
+mme_sgw_t *mme_ue_reselect_sgw(mme_ue_t *mme_ue, enb_ue_t *enb_ue)
+{
+    ogs_assert(mme_ue);
+    ogs_assert(enb_ue);
+    ogs_assert(mme_self()->sgw);
+
+    mme_self()->sgw = selected_sgw_node(mme_self()->sgw, enb_ue);
+    ogs_assert(mme_self()->sgw);
+
+    return mme_self()->sgw;
+}
+
 mme_ue_t *mme_ue_add(enb_ue_t *enb_ue)
 {
     mme_enb_t *enb = NULL;
