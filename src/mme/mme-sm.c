@@ -36,6 +36,13 @@
 #include "mme-s13-handler.h"
 #include "mme-path.h"
 
+/*
+ * Declared and defined in mme-context.c, next to selected_sgw_node().
+ * Not yet exposed via mme-context.h - add it there if you'd rather not
+ * carry this local prototype.
+ */
+mme_sgw_t *mme_ue_reselect_sgw(mme_ue_t *mme_ue, enb_ue_t *enb_ue);
+
 void mme_state_initial(ogs_fsm_t *s, mme_event_t *e)
 {
     mme_sm_debug(e);
@@ -323,6 +330,35 @@ void mme_state_operational(ogs_fsm_t *s, mme_event_t *e)
      * delete the ENB Context instead of sending a UEContextReleaseCommand.
      */
                     HOLDING_S1_CONTEXT(mme_ue);
+                }
+
+                /*
+                 * SGW-C load-balancing on reattach.
+                 *
+                 * We got here because mme_ue_find_by_message() found an
+                 * mme_ue_t that is still alive for this subscriber
+                 * ("Known UE by GUTI/IMSI"), so mme_ue_add() above was
+                 * never called and the SGW-C picked on this subscriber's
+                 * very first attach was never revisited. Left alone,
+                 * every reattach sticks to that same SGW forever.
+                 *
+                 * On a genuine new Attach Request (not a TAU or Service
+                 * Request - those must keep the existing session as-is)
+                 * with no session left bound to the old SGW, force a
+                 * fresh round-robin pick so reattaches load-balance
+                 * across the SGW-C pool the same way a brand-new
+                 * attach does.
+                 */
+                if (nas_message.emm.h.message_type ==
+                        OGS_NAS_EPS_ATTACH_REQUEST &&
+                    ogs_list_count(&mme_ue->sess_list) == 0) {
+                    sgw_ue_t *old_sgw_ue =
+                        sgw_ue_find_by_id(mme_ue->sgw_ue_id);
+                    if (old_sgw_ue) {
+                        mme_sgw_t *new_sgw =
+                            mme_ue_reselect_sgw(mme_ue, enb_ue);
+                        sgw_ue_switch_to_sgw(old_sgw_ue, new_sgw);
+                    }
                 }
             }
 
