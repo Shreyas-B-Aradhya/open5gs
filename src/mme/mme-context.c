@@ -70,6 +70,7 @@ static void stats_remove_mme_session(void);
 static bool compare_ue_info(mme_sgw_t *node, enb_ue_t *enb_ue);
 static mme_sgw_t *selected_sgw_node(mme_sgw_t *current, enb_ue_t *enb_ue);
 static mme_sgw_t *changed_sgw_node(mme_sgw_t *current, enb_ue_t *enb_ue);
+mme_sgw_t *mme_ue_reselect_sgw(mme_ue_t *mme_ue, enb_ue_t *enb_ue);
 
 void mme_context_init(void)
 {
