@@ -280,6 +280,7 @@ int sgsap_send_uplink_unitdata(mme_ue_t *mme_ue,
 
     ogs_debug("[SGSAP] UPLINK-UNITDATA");
     ogs_debug("    IMSI[%s]", mme_ue->imsi_bcd);
+    ogs_debug("    MSISDN[%s]", mme_ue->msisdn_bcd);
     ogs_log_hexdump(OGS_LOG_DEBUG,
             nas_message_container->buffer, nas_message_container->length);
 
