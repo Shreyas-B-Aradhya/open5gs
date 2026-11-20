@@ -70,6 +70,11 @@ typedef struct sgwc_ue_s {
     ogs_list_t      sess_list;
 
     ogs_gtp_node_t  *gnode;
+
+    /* S5 Modify Bearer Requests still out for an S1 handover (step 16a) */
+    int             s1ho_s5_outstanding;
+    uint8_t         s1ho_s5_cause;
+    ogs_pool_id_t   s1ho_s11_xact_id;   /* the MME's Modify Bearer Request */
 } sgwc_ue_t;
 
 #define SGWC_SESS(pfcp_sess) ogs_container_of(pfcp_sess, sgwc_sess_t, pfcp)
@@ -99,6 +104,13 @@ typedef struct sgwc_sess_s {
     ogs_pfcp_node_t *pfcp_node;
 
     ogs_pool_id_t   sgwc_ue_id;
+
+    /*
+     * S1 handover with SGW relocation (TS 23.401 5.5.1.2.2): the session
+     * was created without signalling on S5; the PGW is switched to this
+     * SGW by the Modify Bearer Request that follows Handover Notify.
+     */
+    bool            s1ho_s5_pending;
 } sgwc_sess_t;
 
 typedef struct sgwc_bearer_s {

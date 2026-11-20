@@ -34,6 +34,17 @@ int mme_gtp_send_create_session_request(
 int mme_gtp_send_modify_bearer_request(
         enb_ue_t *enb_ue, mme_ue_t *mme_ue,
         int uli_presence, int modify_action);
+void mme_gtp_send_s10_echo_requests(void);
+int mme_gtp_send_forward_relocation_complete_notification(
+        enb_ue_t *target_ue, mme_ue_t *mme_ue);
+int mme_gtp_send_forward_access_context_notification(
+        enb_ue_t *source_ue, mme_ue_t *mme_ue,
+        const uint8_t *container, int container_len);
+int mme_gtp_send_forward_relocation_request(
+        enb_ue_t *source_ue, mme_ue_t *mme_ue, mme_s10_peer_t *peer,
+        ogs_gtp2_target_identification_t *target,
+        ogs_gtp2_f_cause_t *s1ap_cause,
+        const uint8_t *container, uint16_t container_len);
 int mme_gtp_send_delete_session_request(
         enb_ue_t *enb_ue, sgw_ue_t *sgw_ue, mme_sess_t *sess, int action);
 void mme_gtp_send_delete_all_sessions(

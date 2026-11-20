@@ -39,6 +39,7 @@ int __esm_log_domain;
 
 static OGS_POOL(mme_sgsn_route_pool, mme_sgsn_route_t);
 static OGS_POOL(mme_sgsn_pool, mme_sgsn_t);
+static OGS_POOL(mme_s10_peer_pool, mme_s10_peer_t);
 static OGS_POOL(mme_sgw_pool, mme_sgw_t);
 static OGS_POOL(mme_pgw_pool, mme_pgw_t);
 static OGS_POOL(mme_vlr_pool, mme_vlr_t);
@@ -94,6 +95,7 @@ void mme_context_init(void)
     ogs_list_init(&self.s1ap_list6);
 
     ogs_list_init(&self.sgsn_list);
+    ogs_list_init(&self.s10_list);
     ogs_list_init(&self.sgw_list);
     ogs_list_init(&self.pgw_list);
     ogs_list_init(&self.enb_list);
@@ -104,6 +106,7 @@ void mme_context_init(void)
 
     ogs_pool_init(&mme_sgsn_route_pool, ogs_app()->pool.nf);
     ogs_pool_init(&mme_sgsn_pool, ogs_app()->pool.nf);
+    ogs_pool_init(&mme_s10_peer_pool, ogs_app()->pool.nf);
     ogs_pool_init(&mme_sgw_pool, ogs_app()->pool.nf);
     ogs_pool_init(&mme_pgw_pool, ogs_app()->pool.nf);
     ogs_pool_init(&mme_vlr_pool, ogs_app()->pool.nf);
@@ -161,6 +164,7 @@ void mme_context_final(void)
     mme_csmap_remove_all();
     mme_vlr_remove_all();
     mme_sgsn_remove_all();
+    mme_s10_peer_remove_all();
     mme_hssmap_remove_all();
     mme_emerg_remove_all();
 
@@ -191,6 +195,7 @@ void mme_context_final(void)
     ogs_pool_final(&mme_enb_pool);
 
     ogs_pool_final(&mme_sgsn_pool);
+    ogs_pool_final(&mme_s10_peer_pool);
     ogs_pool_final(&mme_sgsn_route_pool);
     ogs_pool_final(&mme_sgw_pool);
     ogs_pool_final(&mme_pgw_pool);
@@ -407,6 +412,145 @@ static int parse_rai(ogs_yaml_iter_t *parent_iter, ogs_nas_rai_t *rai)
     if (!lai_parsed || !rac_parsed)
         return OGS_ERROR;
     return OGS_OK;
+}
+
+/*
+ * S10 peer MME list. S10 stays disabled unless at least one valid peer is
+ * configured. One entry per peer MME, mapping its GUMMEI to an address:
+ *
+ *   mme:
+ *     s10:
+ *       - address: 127.0.0.12
+ *         plmn_id:
+ *           mcc: 999
+ *           mnc: 70
+ *         mme_gid: 2
+ *         mme_code: 1
+ *
+ * `port` (default: GTPv2-C port) and `family` are optional.
+ */
+static void mme_context_parse_s10(ogs_yaml_iter_t *s10_array)
+{
+    int rv;
+
+    do {
+        ogs_yaml_iter_t s10_iter;
+        ogs_sockaddr_t *addr = NULL;
+        int family = AF_UNSPEC;
+        int i, num = 0;
+        const char *hostname[OGS_MAX_NUM_OF_HOSTNAME];
+        uint16_t port = ogs_gtp_self()->gtpc_port;
+
+        const char *mcc = NULL, *mnc = NULL;
+        int mme_gid = -1, mme_code = -1;
+        ogs_plmn_id_t plmn_id;
+
+        if (ogs_yaml_iter_type(s10_array) == YAML_MAPPING_NODE) {
+            memcpy(&s10_iter, s10_array, sizeof(ogs_yaml_iter_t));
+        } else if (ogs_yaml_iter_type(s10_array) == YAML_SEQUENCE_NODE) {
+            if (!ogs_yaml_iter_next(s10_array))
+                break;
+            ogs_yaml_iter_recurse(s10_array, &s10_iter);
+        } else if (ogs_yaml_iter_type(s10_array) == YAML_SCALAR_NODE) {
+            break;
+        } else
+            ogs_assert_if_reached();
+
+        while (ogs_yaml_iter_next(&s10_iter)) {
+            const char *s10_key = ogs_yaml_iter_key(&s10_iter);
+            ogs_assert(s10_key);
+
+            if (!strcmp(s10_key, "family")) {
+                const char *v = ogs_yaml_iter_value(&s10_iter);
+                if (v) family = atoi(v);
+                if (family != AF_UNSPEC &&
+                    family != AF_INET && family != AF_INET6) {
+                    ogs_warn("Ignore family(%d): AF_UNSPEC(%d), "
+                            "AF_INET(%d), AF_INET6(%d) ",
+                            family, AF_UNSPEC, AF_INET, AF_INET6);
+                    family = AF_UNSPEC;
+                }
+            } else if (!strcmp(s10_key, "address")) {
+                ogs_yaml_iter_t hostname_iter;
+                ogs_yaml_iter_recurse(&s10_iter, &hostname_iter);
+                ogs_assert(ogs_yaml_iter_type(&hostname_iter) !=
+                        YAML_MAPPING_NODE);
+
+                do {
+                    if (ogs_yaml_iter_type(&hostname_iter) ==
+                            YAML_SEQUENCE_NODE) {
+                        if (!ogs_yaml_iter_next(&hostname_iter))
+                            break;
+                    }
+
+                    ogs_assert(num < OGS_MAX_NUM_OF_HOSTNAME);
+                    hostname[num++] = ogs_yaml_iter_value(&hostname_iter);
+                } while (ogs_yaml_iter_type(&hostname_iter) ==
+                        YAML_SEQUENCE_NODE);
+            } else if (!strcmp(s10_key, "port")) {
+                const char *v = ogs_yaml_iter_value(&s10_iter);
+                if (v) port = atoi(v);
+            } else if (!strcmp(s10_key, "plmn_id")) {
+                ogs_yaml_iter_t plmn_id_iter;
+                ogs_yaml_iter_recurse(&s10_iter, &plmn_id_iter);
+                ogs_assert(ogs_yaml_iter_type(&plmn_id_iter) ==
+                        YAML_MAPPING_NODE);
+
+                while (ogs_yaml_iter_next(&plmn_id_iter)) {
+                    const char *plmn_id_key = ogs_yaml_iter_key(&plmn_id_iter);
+                    ogs_assert(plmn_id_key);
+                    if (!strcmp(plmn_id_key, "mcc"))
+                        mcc = ogs_yaml_iter_value(&plmn_id_iter);
+                    else if (!strcmp(plmn_id_key, "mnc"))
+                        mnc = ogs_yaml_iter_value(&plmn_id_iter);
+                }
+            } else if (!strcmp(s10_key, "mme_gid")) {
+                const char *v = ogs_yaml_iter_value(&s10_iter);
+                if (v) mme_gid = atoi(v);
+            } else if (!strcmp(s10_key, "mme_code")) {
+                const char *v = ogs_yaml_iter_value(&s10_iter);
+                if (v) mme_code = atoi(v);
+            } else
+                ogs_warn("unknown key `%s`", s10_key);
+        }
+
+        if (!num || !mcc || !mnc ||
+            mme_gid < 0 || mme_gid > 0xffff ||
+            mme_code < 0 || mme_code > 0xff) {
+            ogs_error("Ignoring invalid mme.s10 entry: address, "
+                    "plmn_id{mcc,mnc}, mme_gid[0-65535] and "
+                    "mme_code[0-255] are all required");
+            continue;
+        }
+
+        ogs_plmn_id_build(&plmn_id, atoi(mcc), atoi(mnc), strlen(mnc));
+
+        if (mme_s10_peer_find_by_gummei(&plmn_id, mme_gid, mme_code)) {
+            ogs_error("Ignoring duplicate mme.s10 entry for "
+                    "GUMMEI[PLMN:%06x,GID:%d,CODE:%d]",
+                    ogs_plmn_id_hexdump(&plmn_id), mme_gid, mme_code);
+            continue;
+        }
+
+        addr = NULL;
+        for (i = 0; i < num; i++) {
+            rv = ogs_addaddrinfo(&addr, family, hostname[i], port, 0);
+            ogs_assert(rv == OGS_OK);
+        }
+
+        ogs_filter_ip_version(&addr,
+                ogs_global_conf()->parameter.no_ipv4,
+                ogs_global_conf()->parameter.no_ipv6,
+                ogs_global_conf()->parameter.prefer_ipv4);
+
+        if (addr == NULL) {
+            ogs_error("Ignoring mme.s10 entry: no usable address");
+            continue;
+        }
+
+        mme_s10_peer_add(addr, &plmn_id, mme_gid, mme_code);
+
+    } while (ogs_yaml_iter_type(s10_array) == YAML_SEQUENCE_NODE);
 }
 
 int mme_context_parse_config(void)
@@ -1416,6 +1560,10 @@ int mme_context_parse_config(void)
                         } else
                             ogs_warn("unknown key `%s`", gtpc_key);
                     }
+                } else if (!strcmp(mme_key, "s10")) {
+                    ogs_yaml_iter_t s10_array;
+                    ogs_yaml_iter_recurse(&mme_iter, &s10_array);
+                    mme_context_parse_s10(&s10_array);
                 } else if (!strcmp(mme_key, "gummei")) {
                     ogs_yaml_iter_t gummei_array, gummei_iter;
                     ogs_yaml_iter_recurse(&mme_iter, &gummei_array);
@@ -2758,6 +2906,119 @@ mme_sgsn_t *mme_sgsn_find_by_addr(const ogs_sockaddr_t *addr)
     return sgsn;
 }
 
+mme_s10_peer_t *mme_s10_peer_add(ogs_sockaddr_t *addr,
+        const ogs_plmn_id_t *plmn_id, uint16_t mme_gid, uint8_t mme_code)
+{
+    char buf[OGS_ADDRSTRLEN];
+    mme_s10_peer_t *peer = NULL;
+
+    ogs_assert(addr);
+    ogs_assert(plmn_id);
+
+    ogs_pool_alloc(&mme_s10_peer_pool, &peer);
+    ogs_assert(peer);
+    memset(peer, 0, sizeof *peer);
+
+    peer->gnode.sa_list = addr;
+
+    ogs_list_init(&peer->gnode.local_list);
+    ogs_list_init(&peer->gnode.remote_list);
+
+    memcpy(&peer->plmn_id, plmn_id, sizeof(peer->plmn_id));
+    peer->mme_gid = mme_gid;
+    peer->mme_code = mme_code;
+
+    ogs_list_add(&self.s10_list, peer);
+
+    ogs_info("S10 peer MME added: GUMMEI[PLMN:%06x,GID:%d,CODE:%d] "
+            "address[%s]", ogs_plmn_id_hexdump(plmn_id), mme_gid, mme_code,
+            OGS_ADDR(addr, buf));
+
+    return peer;
+}
+
+void mme_s10_peer_remove(mme_s10_peer_t *peer)
+{
+    ogs_assert(peer);
+
+    ogs_list_remove(&self.s10_list, peer);
+
+    ogs_gtp_xact_delete_all(&peer->gnode);
+    ogs_freeaddrinfo(peer->gnode.sa_list);
+
+    ogs_pool_free(&mme_s10_peer_pool, peer);
+}
+
+void mme_s10_peer_remove_all(void)
+{
+    mme_s10_peer_t *peer = NULL, *next_peer = NULL;
+
+    ogs_list_for_each_safe(&self.s10_list, next_peer, peer)
+        mme_s10_peer_remove(peer);
+}
+
+mme_s10_peer_t *mme_s10_peer_find_by_addr(const ogs_sockaddr_t *addr)
+{
+    mme_s10_peer_t *peer = NULL;
+
+    ogs_assert(addr);
+
+    ogs_list_for_each(&self.s10_list, peer) {
+        if (ogs_sockaddr_is_equal(&peer->gnode.addr, addr) == true)
+            break;
+    }
+
+    return peer;
+}
+
+mme_s10_peer_t *mme_s10_peer_find_by_gummei(
+        const ogs_plmn_id_t *plmn_id, uint16_t mme_gid, uint8_t mme_code)
+{
+    mme_s10_peer_t *peer = NULL;
+
+    ogs_assert(plmn_id);
+
+    ogs_list_for_each(&self.s10_list, peer) {
+        if (memcmp(&peer->plmn_id, plmn_id, sizeof(peer->plmn_id)) == 0 &&
+            peer->mme_gid == mme_gid && peer->mme_code == mme_code)
+            break;
+    }
+
+    return peer;
+}
+
+bool mme_s10_is_enabled(void)
+{
+    return !ogs_list_empty(&self.s10_list);
+}
+
+/* True if the GUMMEI is one this MME serves itself (mme.gummei) */
+bool mme_gummei_is_served(
+        const ogs_plmn_id_t *plmn_id, uint16_t mme_gid, uint8_t mme_code)
+{
+    int i, j, k, l;
+
+    ogs_assert(plmn_id);
+
+    for (i = 0; i < self.num_of_served_gummei; i++) {
+        served_gummei_t *g = &self.served_gummei[i];
+
+        for (j = 0; j < g->num_of_plmn_id; j++) {
+            if (memcmp(&g->plmn_id[j], plmn_id, sizeof(*plmn_id)) != 0)
+                continue;
+            for (k = 0; k < g->num_of_mme_gid; k++) {
+                if (g->mme_gid[k] != mme_gid)
+                    continue;
+                for (l = 0; l < g->num_of_mme_code; l++)
+                    if (g->mme_code[l] == mme_code)
+                        return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 /* Find SGSN holding route provided in params. Return SGSN configured as default
  * routing if no matching route found. */
 mme_sgsn_t *mme_sgsn_find_by_routing_address(const ogs_nas_rai_t *rai, uint16_t cell_id)
@@ -3837,6 +4098,7 @@ void mme_ue_remove(mme_ue_t *mme_ue)
 
     /* Clear Transparent Container */
     OGS_ASN_CLEAR_DATA(&mme_ue->container);
+    OGS_ASN_CLEAR_DATA(&mme_ue->s10.container);
 
     /* Delete All Timers */
     CLEAR_MME_UE_ALL_TIMERS(mme_ue);
@@ -4350,6 +4612,18 @@ int mme_ue_xact_count(mme_ue_t *mme_ue, uint8_t org)
 
 void enb_ue_associate_mme_ue(enb_ue_t *enb_ue, mme_ue_t *mme_ue)
 {
+    /*
+     * The UE has a new S1 context here while an S10 relocation away from
+     * this MME was prepared but not completed (e.g. it returned to the
+     * source cell): the relocation is over, the sessions are this MME's.
+     */
+    if (mme_ue && (mme_ue->s10.state == MME_S10_SRC_FORWARDING ||
+                mme_ue->s10.state == MME_S10_SRC_PREPARED)) {
+        ogs_warn("[%s] S10 relocation abandoned: UE back on this MME",
+                mme_ue->imsi_bcd);
+        mme_ue->s10.state = MME_S10_NONE;
+    }
+
     ogs_assert(mme_ue);
     ogs_assert(enb_ue);
 

@@ -49,6 +49,7 @@ extern int __esm_log_domain;
 #define OGS_LOG_DOMAIN __mme_log_domain
 
 typedef struct mme_sgsn_s mme_sgsn_t;
+typedef struct mme_s10_peer_s mme_s10_peer_t;
 typedef struct mme_sgw_s mme_sgw_t;
 typedef struct mme_pgw_s mme_pgw_t;
 typedef struct mme_vlr_s mme_vlr_t;
@@ -90,6 +91,7 @@ typedef struct mme_context_s {
     mme_sgw_t       *sgw;           /* Iterator for SGW round-robin */
 
     ogs_list_t      sgsn_list;       /* SGW GTPv1C Client List */
+    ogs_list_t      s10_list;        /* S10 peer MME GTPv2C List; empty => S10 disabled */
 
     ogs_list_t      pgw_list;       /* PGW GTPC Client List */
     ogs_sockaddr_t  *pgw_addr;      /* First IPv4 Address Selected */
@@ -186,6 +188,18 @@ typedef struct mme_sgsn_s {
     ogs_list_t      route_list; /* list of mme_sgsn_route_t */
     bool            default_route; /* use this SGSN as default route */
 } mme_sgsn_t;
+
+/*
+ * S10 peer MME (TS 29.274 / TS 23.401 5.3.2.1, 5.3.3.1).
+ * A peer is identified by its GUMMEI (PLMN + MME Group ID + MME Code)
+ * and reached at the address(es) in gnode.sa_list over GTPv2-C (port 2123).
+ */
+typedef struct mme_s10_peer_s {
+    ogs_gtp_node_t  gnode;
+    ogs_plmn_id_t   plmn_id;
+    uint16_t        mme_gid;
+    uint8_t         mme_code;
+} mme_s10_peer_t;
 
 typedef struct mme_sgw_s {
     ogs_gtp_node_t  gnode;
@@ -807,6 +821,43 @@ struct mme_ue_s {
     /* S1AP Transparent Container */
     OCTET_STRING_t  container;
 
+    /*
+     * S10 inter-MME S1 handover (TS 23.401 5.5.1.2.2).
+     *
+     * Target side: the context was created from a Forward Relocation
+     * Request. The request is answered only once the target eNB has
+     * answered the Handover Request, so the remote transaction is kept.
+     * Source side: the peer's S10 control TEID, learnt from the
+     * Forward Relocation Response.
+     */
+#define MME_S10_NONE            0
+#define MME_S10_TGT_CREATING    1   /* step 4: Create Session Request(s) out */
+#define MME_S10_TGT_HO_REQUEST  2   /* step 5: Handover Request out */
+#define MME_S10_TGT_FORWARDING  3   /* step 6: indirect forwarding tunnels */
+#define MME_S10_TGT_PREPARED    4   /* step 7: answered, waiting for UE */
+#define MME_S10_TGT_NOTIFIED    5   /* step 11: Handover Notify received */
+#define MME_S10_TGT_CLEANUP     6   /* failed: sessions being removed */
+#define MME_S10_SRC_FORWARDING  10  /* step 8: indirect tunnels on source SGW */
+#define MME_S10_SRC_PREPARED    11  /* step 9: Handover Command sent */
+#define MME_S10_SRC_COMPLETING  12  /* step 14: releasing the source side */
+#define MME_S10_IS_SOURCE(__mME) \
+    ((__mME) && (__mME)->s10.state >= MME_S10_SRC_FORWARDING && \
+     (__mME)->s10.state <= MME_S10_SRC_COMPLETING)
+#define MME_S10_IS_TARGET(__mME) \
+    ((__mME) && (__mME)->s10.state >= MME_S10_TGT_CREATING && \
+     (__mME)->s10.state <= MME_S10_TGT_CLEANUP)
+    struct {
+        int             state;
+        ogs_pool_id_t   xact_id;        /* target: pending FRR transaction */
+        uint32_t        peer_teid;      /* peer MME S10 control TEID */
+        ogs_gtp_node_t  *gnode;         /* peer MME S10 node (static) */
+        ogs_ip_t        peer_ip;        /* peer MME S10 control address */
+        uint32_t        target_enb_id;
+        bool            direct_forwarding;  /* target: DFI in the FRR */
+        ogs_gtp2_f_cause_t s1ap_cause;  /* target: from the FRR */
+        OCTET_STRING_t  container;      /* target: Source to Target */
+    } s10;
+
     /* GTP Request/Response Counter */
 #define GTP_COUNTER_CLEAR(__mME, __tYPE) \
         do { \
@@ -838,6 +889,8 @@ struct mme_ue_s {
 #define GTP_COUNTER_CREATE_SESSION_BY_PATH_SWITCH               1
 #define GTP_COUNTER_DELETE_SESSION_BY_PATH_SWITCH               2
 #define GTP_COUNTER_DELETE_SESSION_BY_TAU                       3
+#define GTP_COUNTER_CREATE_SESSION_BY_S10_HANDOVER              4
+#define GTP_COUNTER_DELETE_SESSION_BY_S10_HANDOVER              5
     struct {
         uint8_t request;
         uint8_t response;
@@ -899,6 +952,17 @@ typedef struct mme_sess_s {
 
     uint32_t        pgw_s5c_teid;
     ogs_ip_t        pgw_s5c_ip;
+
+    /*
+     * S10 relocation map: identifiers of this session on the SOURCE side.
+     * Kept only to map the fresh session to the old one; never used to
+     * signal towards the source core.
+     */
+    struct {
+        bool        relocated;
+        uint32_t    pgw_s5c_teid;
+        ogs_ip_t    pgw_s5c_ip;
+    } src;
 
     /* PDN Connectivity Request */
     ogs_nas_request_type_t ue_request_type;
@@ -985,6 +1049,15 @@ typedef struct mme_bearer_s {
     uint32_t        pgw_s5u_teid;
     ogs_ip_t        pgw_s5u_ip;
 
+    /* S10 relocation map: this bearer's identifiers on the SOURCE side */
+    struct {
+        uint8_t     ebi;
+        uint32_t    sgw_s1u_teid;
+        ogs_ip_t    sgw_s1u_ip;
+        uint32_t    pgw_s5u_teid;
+        ogs_ip_t    pgw_s5u_ip;
+    } src;
+
     uint32_t        target_s1u_teid;    /* Target S1U TEID from HO-Req-Ack */
     ogs_ip_t        target_s1u_ip;      /* Target S1U ADDR from HO-Req-Ack */
 
@@ -995,6 +1068,20 @@ typedef struct mme_bearer_s {
 
     uint32_t        sgw_dl_teid;
     ogs_ip_t        sgw_dl_ip;
+
+    /*
+     * Source MME of an S10 relocation: data forwarding F-TEIDs from the
+     * Forward Relocation Response (target SGW for indirect forwarding,
+     * target eNB for direct). Kept apart from enb_dl/ul_*, which mean
+     * "indirect tunnel to delete" to the release procedures.
+     */
+    struct {
+        bool        indirect;   /* F-TEIDs are the target SGW's */
+        uint32_t    dl_teid;
+        ogs_ip_t    dl_ip;
+        uint32_t    ul_teid;
+        ogs_ip_t    ul_ip;
+    } s10_fwd;
     uint32_t        sgw_ul_teid;
     ogs_ip_t        sgw_ul_ip;
 
@@ -1060,6 +1147,17 @@ void mme_sgsn_remove_all(void);
 mme_sgsn_t *mme_sgsn_find_by_addr(const ogs_sockaddr_t *addr);
 mme_sgsn_t *mme_sgsn_find_by_routing_address(const ogs_nas_rai_t *rai, uint16_t cell_id);
 mme_sgsn_t *mme_sgsn_find_by_default_routing_address(void);
+
+mme_s10_peer_t *mme_s10_peer_add(ogs_sockaddr_t *addr,
+        const ogs_plmn_id_t *plmn_id, uint16_t mme_gid, uint8_t mme_code);
+void mme_s10_peer_remove(mme_s10_peer_t *peer);
+void mme_s10_peer_remove_all(void);
+mme_s10_peer_t *mme_s10_peer_find_by_addr(const ogs_sockaddr_t *addr);
+mme_s10_peer_t *mme_s10_peer_find_by_gummei(
+        const ogs_plmn_id_t *plmn_id, uint16_t mme_gid, uint8_t mme_code);
+bool mme_s10_is_enabled(void);
+bool mme_gummei_is_served(
+        const ogs_plmn_id_t *plmn_id, uint16_t mme_gid, uint8_t mme_code);
 
 mme_sgw_t *mme_sgw_add(ogs_sockaddr_t *addr);
 void mme_sgw_remove(mme_sgw_t *sgw);

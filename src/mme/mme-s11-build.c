@@ -323,7 +323,13 @@ ogs_pkbuf_t *mme_s11_build_create_session_request(
         }
 
         if (create_action == OGS_GTP_CREATE_IN_PATH_SWITCH_REQUEST ||
-            create_action == OGS_GTP_CREATE_IN_TRACKING_AREA_UPDATE) {
+            create_action == OGS_GTP_CREATE_IN_TRACKING_AREA_UPDATE ||
+            /*
+             * S1 handover with SGW relocation (TS 23.401 5.5.1.2.2 step 4):
+             * the bearer keeps its PGW S5/S8-U F-TEID. Operation Indication
+             * stays 0, so the target SGW-C does not signal on S5 yet.
+             */
+            create_action == OGS_GTP_CREATE_IN_S10_HANDOVER) {
 
             /* Data Plane(DL) : PGW-S5U */
             memset(&pgw_s5u_teid[i], 0, sizeof(ogs_gtp2_f_teid_t));
@@ -340,12 +346,37 @@ ogs_pkbuf_t *mme_s11_build_create_session_request(
         }
 
         memset(&bearer_qos, 0, sizeof(bearer_qos));
-        bearer_qos.qci = session->qos.index;
-        bearer_qos.priority_level = session->qos.arp.priority_level;
-        bearer_qos.pre_emption_capability =
-            session->qos.arp.pre_emption_capability;
-        bearer_qos.pre_emption_vulnerability =
-            session->qos.arp.pre_emption_vulnerability;
+        if (create_action == OGS_GTP_CREATE_IN_S10_HANDOVER &&
+            bearer != mme_default_bearer_in_sess(sess)) {
+            /*
+             * Dedicated bearer relocated over S10 (e.g. QCI 1 of a VoLTE
+             * call): its own QoS and TFT, not the session's.
+             */
+            bearer_qos.qci = bearer->qos.index;
+            bearer_qos.priority_level = bearer->qos.arp.priority_level;
+            bearer_qos.pre_emption_capability =
+                bearer->qos.arp.pre_emption_capability;
+            bearer_qos.pre_emption_vulnerability =
+                bearer->qos.arp.pre_emption_vulnerability;
+            bearer_qos.ul_mbr = bearer->qos.mbr.uplink;
+            bearer_qos.dl_mbr = bearer->qos.mbr.downlink;
+            bearer_qos.ul_gbr = bearer->qos.gbr.uplink;
+            bearer_qos.dl_gbr = bearer->qos.gbr.downlink;
+            if (bearer->tft.data && bearer->tft.len) {
+                req->bearer_contexts_to_be_created[i].tft.presence = 1;
+                req->bearer_contexts_to_be_created[i].tft.data =
+                    bearer->tft.data;
+                req->bearer_contexts_to_be_created[i].tft.len =
+                    bearer->tft.len;
+            }
+        } else {
+            bearer_qos.qci = session->qos.index;
+            bearer_qos.priority_level = session->qos.arp.priority_level;
+            bearer_qos.pre_emption_capability =
+                session->qos.arp.pre_emption_capability;
+            bearer_qos.pre_emption_vulnerability =
+                session->qos.arp.pre_emption_vulnerability;
+        }
         req->bearer_contexts_to_be_created[i].bearer_level_qos.presence = 1;
         ogs_gtp2_build_bearer_qos(
                 &req->bearer_contexts_to_be_created[i].bearer_level_qos,
@@ -542,7 +573,22 @@ ogs_pkbuf_t *mme_s11_build_delete_session_request(
             uli_buf, OGS_GTP2_MAX_ULI_LEN);
 
     memset(&indication, 0, sizeof(ogs_gtp2_indication_t));
-    if (action == OGS_GTP_DELETE_IN_PATH_SWITCH_REQUEST) {
+    if (action == OGS_GTP_DELETE_IN_PATH_SWITCH_REQUEST ||
+        /* S10 relocation failed: delete on the target SGW only, the PGW
+         * session still belongs to the source side */
+        action == OGS_GTP_DELETE_IN_S10_HANDOVER ||
+        /*
+         * Any other deletion of a session that arrived over S10 before
+         * its S5 path was switched to the target SGW (e.g. the UE attaches
+         * again on this MME): the PGW session belongs to the source side.
+         */
+        (sess->src.relocated && MME_S10_IS_TARGET(mme_ue)) ||
+        /*
+         * Source side of an S10 relocation (Handover Command sent): the
+         * PGW session moves with the UE to the target SGW; deleting it
+         * from here would cut the UE's PDN connection.
+         */
+        MME_S10_IS_SOURCE(mme_ue)) {
         indication.scope_indication = 1;
     } else {
         indication.operation_indication = 1;

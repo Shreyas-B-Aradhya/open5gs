@@ -24,6 +24,8 @@
 #include "mme-gtp-path.h"
 #include "mme-path.h"
 #include "s1ap-path.h"
+#include "mme-s10-build.h"
+#include "mme-s10-handler.h"
 #include "mme-s11-build.h"
 #include "mme-sm.h"
 
@@ -38,6 +40,7 @@ static void _gtpv1v2_c_recv_cb(short when, ogs_socket_t fd, void *data)
     ogs_sockaddr_t from;
     mme_sgw_t *sgw = NULL;
     mme_sgsn_t *sgsn = NULL;
+    mme_s10_peer_t *s10_peer = NULL;
     uint8_t gtp_ver;
 
     ogs_assert(fd != INVALID_SOCKET);
@@ -71,9 +74,22 @@ static void _gtpv1v2_c_recv_cb(short when, ogs_socket_t fd, void *data)
         e->gnode = &sgsn->gnode;
         break;
     case 2:
+        /*
+         * S10 shares the GTPv2-C socket with S11. A message from a
+         * configured peer MME goes to the S10 handler; everything else
+         * follows the usual S11 path, and unknown senders are dropped.
+         */
+        s10_peer = mme_s10_peer_find_by_addr(&from);
+        if (s10_peer) {
+            e = mme_event_new(MME_EVENT_S10_MESSAGE);
+            ogs_assert(e);
+            e->gnode = &s10_peer->gnode;
+            break;
+        }
+
         sgw = mme_sgw_find_by_addr(&from);
         if (!sgw) {
-            ogs_error("Unknown SGW : %s", OGS_ADDR(&from, buf));
+            ogs_error("Unknown SGW/S10 peer : %s", OGS_ADDR(&from, buf));
             ogs_pkbuf_free(pkbuf);
             return;
         }
@@ -115,6 +131,9 @@ static void timeout(ogs_gtp_xact_t *xact, void *data)
 
     switch (type) {
     case OGS_GTP2_MODIFY_BEARER_REQUEST_TYPE:
+    case OGS_GTP2_FORWARD_RELOCATION_REQUEST_TYPE:
+    case OGS_GTP2_FORWARD_ACCESS_CONTEXT_NOTIFICATION_TYPE:
+    case OGS_GTP2_FORWARD_RELOCATION_COMPLETE_NOTIFICATION_TYPE:
     case OGS_GTP2_RELEASE_ACCESS_BEARERS_REQUEST_TYPE:
     case OGS_GTP2_CREATE_INDIRECT_DATA_FORWARDING_TUNNEL_REQUEST_TYPE:
     case OGS_GTP2_DELETE_INDIRECT_DATA_FORWARDING_TUNNEL_REQUEST_TYPE:
@@ -171,6 +190,56 @@ static void timeout(ogs_gtp_xact_t *xact, void *data)
     ogs_assert(mme_ue);
     enb_ue = enb_ue_find_by_id(mme_ue->enb_ue_id);
 
+    /*
+     * Target side of an S10 relocation: the generic handling below would
+     * release the sessions towards the PGW, which still serves the UE
+     * through the source side.
+     */
+    if (type == OGS_GTP2_FORWARD_RELOCATION_COMPLETE_NOTIFICATION_TYPE) {
+        /* The UE is served here anyway; the source cleans up on its own */
+        ogs_error("GTP Timeout : IMSI[%s] Forward Relocation Complete "
+                "Notification not acknowledged", mme_ue->imsi_bcd);
+        return;
+    }
+
+    if (type == OGS_GTP2_FORWARD_ACCESS_CONTEXT_NOTIFICATION_TYPE) {
+        /* The handover goes on; the target eNB lacks the PDCP status */
+        ogs_error("GTP Timeout : IMSI[%s] Forward Access Context "
+                "Notification not acknowledged", mme_ue->imsi_bcd);
+        return;
+    }
+
+    if (mme_ue->s10.state == MME_S10_SRC_FORWARDING &&
+        type == OGS_GTP2_CREATE_INDIRECT_DATA_FORWARDING_TUNNEL_REQUEST_TYPE) {
+        ogs_error("GTP Timeout : IMSI[%s] Message-Type[%d] (S10 source)",
+                mme_ue->imsi_bcd, type);
+        mme_ue->s10.state = MME_S10_NONE;
+        if (enb_ue) {
+            int r = s1ap_send_handover_preparation_failure(enb_ue,
+                    S1AP_Cause_PR_radioNetwork,
+                    S1AP_CauseRadioNetwork_ho_failure_in_target_EPC_eNB_or_target_system);
+            ogs_expect(r == OGS_OK);
+        }
+        return;
+    }
+
+    if ((mme_ue->s10.state == MME_S10_TGT_CREATING &&
+         type == OGS_GTP2_CREATE_SESSION_REQUEST_TYPE) ||
+        (mme_ue->s10.state == MME_S10_TGT_FORWARDING &&
+         type ==
+            OGS_GTP2_CREATE_INDIRECT_DATA_FORWARDING_TUNNEL_REQUEST_TYPE) ||
+        (mme_ue->s10.state == MME_S10_TGT_CLEANUP &&
+         type == OGS_GTP2_DELETE_SESSION_REQUEST_TYPE)) {
+        ogs_error("GTP Timeout : IMSI[%s] Message-Type[%d] (S10 relocation)",
+                mme_ue->imsi_bcd, type);
+        if (type == OGS_GTP2_DELETE_SESSION_REQUEST_TYPE)
+            mme_s10_target_cleanup_done(mme_ue);
+        else
+            mme_s10_target_fail(mme_ue, OGS_GTP2_CAUSE_RELOCATION_FAILURE,
+                    "no response from the target SGW");
+        return;
+    }
+
     switch (type) {
     case OGS_GTP2_DELETE_SESSION_REQUEST_TYPE:
         /*
@@ -197,6 +266,21 @@ static void timeout(ogs_gtp_xact_t *xact, void *data)
     case OGS_GTP2_BEARER_RESOURCE_COMMAND_TYPE:
         /* Nothing to do */
         break;
+    case OGS_GTP2_FORWARD_RELOCATION_REQUEST_TYPE:
+        /*
+         * The target MME did not answer. The UE is still served here, so
+         * only fail the handover preparation towards the source eNB.
+         * Do not release the UE context.
+         */
+        if (enb_ue) {
+            r = s1ap_send_handover_preparation_failure(enb_ue,
+                    S1AP_Cause_PR_radioNetwork,
+                    S1AP_CauseRadioNetwork_ho_failure_in_target_EPC_eNB_or_target_system);
+            ogs_expect(r == OGS_OK);
+            ogs_assert(r != OGS_ERROR);
+        } else
+            ogs_warn("No S1 Context");
+        break;
     default:
         if (enb_ue)
             mme_send_delete_session_or_mme_ue_context_release(enb_ue, mme_ue);
@@ -216,6 +300,7 @@ int mme_gtp_open(void)
     ogs_sock_t *sock = NULL;
     mme_sgw_t *sgw = NULL;
     mme_sgsn_t *sgsn = NULL;
+    mme_s10_peer_t *s10_peer = NULL;
 
     ogs_list_for_each(&ogs_gtp_self()->gtpc_list, node) {
         sock = ogs_gtp_server(node);
@@ -255,6 +340,13 @@ int mme_gtp_open(void)
         rv = ogs_gtp_connect(
                 ogs_gtp_self()->gtpc_sock, ogs_gtp_self()->gtpc_sock6,
                 &sgsn->gnode);
+        ogs_assert(rv == OGS_OK);
+    }
+
+    ogs_list_for_each(&mme_self()->s10_list, s10_peer) {
+        rv = ogs_gtp_connect(
+                ogs_gtp_self()->gtpc_sock, ogs_gtp_self()->gtpc_sock6,
+                &s10_peer->gnode);
         ogs_assert(rv == OGS_OK);
     }
 
@@ -310,6 +402,170 @@ int mme_gtp_send_create_session_request(
         xact->enb_ue_id = enb_ue->id;
     else
         xact->enb_ue_id = OGS_INVALID_POOL_ID;
+
+    rv = ogs_gtp_xact_commit(xact);
+    ogs_expect(rv == OGS_OK);
+
+    return rv;
+}
+
+/*
+ * Send one Echo Request to every configured S10 peer MME. The peer's Echo
+ * Response (logged in the S10 dispatch) shows that the path, the source
+ * address/port match and the S10 demux work in both directions.
+ */
+void mme_gtp_send_s10_echo_requests(void)
+{
+    char buf[OGS_ADDRSTRLEN];
+    mme_s10_peer_t *peer = NULL;
+
+    ogs_list_for_each(&mme_self()->s10_list, peer) {
+        if (mme_gummei_is_served(
+                    &peer->plmn_id, peer->mme_gid, peer->mme_code))
+            ogs_warn("S10 peer GUMMEI[PLMN:%06x,GID:%d,CODE:%d] equals a "
+                    "GUMMEI served by this MME: a GUTI from that peer "
+                    "cannot be told apart from a local one",
+                    ogs_plmn_id_hexdump(&peer->plmn_id),
+                    peer->mme_gid, peer->mme_code);
+
+        ogs_info("S10 sending Echo Request to peer MME[%s]",
+                OGS_ADDR(peer->gnode.sa_list, buf));
+        ogs_gtp2_send_echo_request(&peer->gnode, 0, 0);
+    }
+}
+
+int mme_gtp_send_forward_relocation_request(
+        enb_ue_t *source_ue, mme_ue_t *mme_ue, mme_s10_peer_t *peer,
+        ogs_gtp2_target_identification_t *target,
+        ogs_gtp2_f_cause_t *s1ap_cause,
+        const uint8_t *container, uint16_t container_len)
+{
+    int rv;
+    ogs_gtp2_header_t h;
+    ogs_pkbuf_t *pkbuf = NULL;
+    ogs_gtp_xact_t *xact = NULL;
+    sgw_ue_t *sgw_ue = NULL;
+
+    ogs_assert(source_ue);
+    ogs_assert(mme_ue);
+    ogs_assert(peer);
+
+    sgw_ue = sgw_ue_find_by_id(mme_ue->sgw_ue_id);
+    if (!sgw_ue) {
+        ogs_error("No SGW-UE context");
+        return OGS_ERROR;
+    }
+
+    /* TEID is 0: the peer has no control-plane TEID for this UE yet */
+    memset(&h, 0, sizeof(ogs_gtp2_header_t));
+    h.type = OGS_GTP2_FORWARD_RELOCATION_REQUEST_TYPE;
+    h.teid = 0;
+
+    pkbuf = mme_s10_build_forward_relocation_request(
+            h.type, mme_ue, sgw_ue, target, s1ap_cause,
+            container, container_len);
+    if (!pkbuf) {
+        ogs_error("mme_s10_build_forward_relocation_request() failed");
+        return OGS_ERROR;
+    }
+
+    xact = ogs_gtp_xact_local_create(
+            &peer->gnode, &h, pkbuf, timeout,
+            OGS_UINT_TO_POINTER(mme_ue->id));
+    if (!xact) {
+        ogs_error("ogs_gtp_xact_local_create() failed");
+        return OGS_ERROR;
+    }
+    xact->local_teid = mme_ue->mme_s11_teid;
+    xact->enb_ue_id = source_ue->id;
+
+    rv = ogs_gtp_xact_commit(xact);
+    ogs_expect(rv == OGS_OK);
+
+    return rv;
+}
+
+/* Target MME: Forward Relocation Complete Notification to the source MME */
+int mme_gtp_send_forward_relocation_complete_notification(
+        enb_ue_t *target_ue, mme_ue_t *mme_ue)
+{
+    int rv;
+    ogs_gtp2_header_t h;
+    ogs_pkbuf_t *pkbuf = NULL;
+    ogs_gtp_xact_t *xact = NULL;
+
+    ogs_assert(mme_ue);
+
+    if (!mme_ue->s10.gnode || !mme_ue->s10.peer_teid) {
+        ogs_error("[%s] No S10 peer for this UE", mme_ue->imsi_bcd);
+        return OGS_ERROR;
+    }
+
+    memset(&h, 0, sizeof(ogs_gtp2_header_t));
+    h.type = OGS_GTP2_FORWARD_RELOCATION_COMPLETE_NOTIFICATION_TYPE;
+    h.teid = mme_ue->s10.peer_teid;
+
+    pkbuf = mme_s10_build_forward_relocation_complete_notification(h.type);
+    if (!pkbuf) {
+        ogs_error("mme_s10_build_forward_relocation_complete_notification() "
+                "failed");
+        return OGS_ERROR;
+    }
+
+    xact = ogs_gtp_xact_local_create(mme_ue->s10.gnode, &h, pkbuf, timeout,
+            OGS_UINT_TO_POINTER(mme_ue->id));
+    if (!xact) {
+        ogs_error("ogs_gtp_xact_local_create() failed");
+        return OGS_ERROR;
+    }
+    xact->local_teid = mme_ue->mme_s11_teid;
+    if (target_ue)
+        xact->enb_ue_id = target_ue->id;
+
+    rv = ogs_gtp_xact_commit(xact);
+    ogs_expect(rv == OGS_OK);
+
+    return rv;
+}
+
+/* Source MME: Forward Access Context Notification to the target MME */
+int mme_gtp_send_forward_access_context_notification(
+        enb_ue_t *source_ue, mme_ue_t *mme_ue,
+        const uint8_t *container, int container_len)
+{
+    int rv;
+    ogs_gtp2_header_t h;
+    ogs_pkbuf_t *pkbuf = NULL;
+    ogs_gtp_xact_t *xact = NULL;
+
+    ogs_assert(source_ue);
+    ogs_assert(mme_ue);
+
+    if (!mme_ue->s10.gnode || !mme_ue->s10.peer_teid) {
+        ogs_error("[%s] No S10 peer for this UE", mme_ue->imsi_bcd);
+        return OGS_ERROR;
+    }
+
+    memset(&h, 0, sizeof(ogs_gtp2_header_t));
+    h.type = OGS_GTP2_FORWARD_ACCESS_CONTEXT_NOTIFICATION_TYPE;
+    h.teid = mme_ue->s10.peer_teid;
+
+    pkbuf = mme_s10_build_forward_access_context_notification(
+            h.type, container, container_len);
+    if (!pkbuf) {
+        ogs_error("mme_s10_build_forward_access_context_notification() "
+                "failed");
+        return OGS_ERROR;
+    }
+
+    xact = ogs_gtp_xact_local_create(mme_ue->s10.gnode, &h, pkbuf, timeout,
+            OGS_UINT_TO_POINTER(mme_ue->id));
+    if (!xact) {
+        ogs_error("ogs_gtp_xact_local_create() failed");
+        return OGS_ERROR;
+    }
+    xact->local_teid = mme_ue->mme_s11_teid;
+    xact->enb_ue_id = source_ue->id;
 
     rv = ogs_gtp_xact_commit(xact);
     ogs_expect(rv == OGS_OK);

@@ -30,6 +30,7 @@
 #include "esm-handler.h"
 #include "mme-gn-handler.h"
 #include "mme-gtp-path.h"
+#include "mme-s10-handler.h"
 #include "mme-s11-handler.h"
 #include "mme-fd-path.h"
 #include "mme-s6a-handler.h"
@@ -93,6 +94,7 @@ void mme_state_operational(ogs_fsm_t *s, mme_event_t *e)
 
     switch (e->id) {
     case OGS_FSM_ENTRY_SIG:
+        mme_gtp_send_s10_echo_requests();
         break;
 
     case OGS_FSM_EXIT_SIG:
@@ -852,6 +854,84 @@ cleanup:
             mme_s11_handle_bearer_resource_failure_indication(
                 xact, mme_ue,
                 &gtp_message.bearer_resource_failure_indication);
+            break;
+        default:
+            ogs_warn("Not implemented(type:%d)", gtp_message.h.type);
+            break;
+        }
+        ogs_pkbuf_free(pkbuf);
+        break;
+
+    case MME_EVENT_S10_MESSAGE:
+        pkbuf = e->pkbuf;
+        ogs_assert(pkbuf);
+
+        if (ogs_gtp2_parse_msg(&gtp_message, pkbuf) != OGS_OK) {
+            ogs_error("ogs_gtp2_parse_msg() failed");
+            ogs_pkbuf_free(pkbuf);
+            break;
+        }
+
+        gnode = e->gnode;
+        ogs_assert(gnode);
+
+        rv = ogs_gtp_xact_receive(gnode, &gtp_message.h, &xact);
+        if (rv != OGS_OK) {
+            ogs_pkbuf_free(pkbuf);
+            break;
+        }
+
+        switch (gtp_message.h.type) {
+        case OGS_GTP2_ECHO_REQUEST_TYPE:
+            ogs_info("S10 Echo Request from peer MME[%s]",
+                    OGS_ADDR(&gnode->addr, buf));
+            mme_s11_handle_echo_request(xact, &gtp_message.echo_request);
+            break;
+        case OGS_GTP2_ECHO_RESPONSE_TYPE:
+            ogs_info("S10 Echo Response from peer MME[%s]",
+                    OGS_ADDR(&gnode->addr, buf));
+            mme_s11_handle_echo_response(xact, &gtp_message.echo_response);
+            break;
+
+        case OGS_GTP2_FORWARD_RELOCATION_REQUEST_TYPE:
+            mme_s10_handle_forward_relocation_request(
+                    xact, &gtp_message.forward_relocation_request);
+            break;
+        case OGS_GTP2_FORWARD_RELOCATION_RESPONSE_TYPE:
+            mme_s10_handle_forward_relocation_response(
+                    xact, &gtp_message.forward_relocation_response);
+            break;
+        case OGS_GTP2_FORWARD_RELOCATION_COMPLETE_NOTIFICATION_TYPE:
+            mme_s10_handle_forward_relocation_complete_notification(
+                    xact, gtp_message.h.teid,
+                    &gtp_message.forward_relocation_complete_notification);
+            break;
+        case OGS_GTP2_FORWARD_RELOCATION_COMPLETE_ACKNOWLEDGE_TYPE:
+            mme_s10_handle_forward_relocation_complete_acknowledge(
+                    xact, &gtp_message.forward_relocation_complete_acknowledge);
+            break;
+        case OGS_GTP2_FORWARD_ACCESS_CONTEXT_NOTIFICATION_TYPE:
+            mme_s10_handle_forward_access_context_notification(
+                    xact, gtp_message.h.teid,
+                    &gtp_message.forward_access_context_notification);
+            break;
+        case OGS_GTP2_FORWARD_ACCESS_CONTEXT_ACKNOWLEDGE_TYPE:
+            mme_s10_handle_forward_access_context_acknowledge(
+                    xact, &gtp_message.forward_access_context_acknowledge);
+            break;
+
+        /*
+         * Not implemented yet. The peer gets no answer and falls back to
+         * its own timeout handling, which is the behaviour a peer without
+         * S10 support would show anyway.
+         */
+        case OGS_GTP2_IDENTIFICATION_REQUEST_TYPE:
+        case OGS_GTP2_IDENTIFICATION_RESPONSE_TYPE:
+        case OGS_GTP2_CONTEXT_REQUEST_TYPE:
+        case OGS_GTP2_CONTEXT_RESPONSE_TYPE:
+        case OGS_GTP2_CONTEXT_ACKNOWLEDGE_TYPE:
+            ogs_warn("S10 message not implemented yet (type:%d)",
+                    gtp_message.h.type);
             break;
         default:
             ogs_warn("Not implemented(type:%d)", gtp_message.h.type);

@@ -134,6 +134,7 @@ typedef struct ogs_gtp_xact_s {
 #define OGS_GTP_DELETE_HANDLE_PDN_CONNECTIVITY_REQUEST          7
 #define OGS_GTP_DELETE_IN_PATH_SWITCH_REQUEST                   8
 #define OGS_GTP_DELETE_SEND_TAU_ACCEPT                          9
+#define OGS_GTP_DELETE_IN_S10_HANDOVER                          10
 
     int             delete_action;
 
@@ -151,10 +152,13 @@ typedef struct ogs_gtp_xact_s {
 #define OGS_GTP_CREATE_IN_UPLINK_NAS_TRANSPORT 2
 #define OGS_GTP_CREATE_IN_PATH_SWITCH_REQUEST 3
 #define OGS_GTP_CREATE_IN_TRACKING_AREA_UPDATE 4 /* 3GPP TS 33.401 9.1.2 */
+#define OGS_GTP_CREATE_IN_S10_HANDOVER 5 /* TS 23.401 5.5.1.2.2 step 4 */
     int             create_action;
 
 #define OGS_GTP_MODIFY_IN_PATH_SWITCH_REQUEST 1
 #define OGS_GTP_MODIFY_IN_E_RAB_MODIFICATION 2
+#define OGS_GTP_MODIFY_IN_S10_HANDOVER 3        /* MME: TS 23.401 step 16 */
+#define OGS_GTP_MODIFY_IN_S1_HANDOVER_SGW_RELOCATION 4  /* SGW-C: step 16a */
     int             modify_action;
 } ogs_gtp_xact_t;
 

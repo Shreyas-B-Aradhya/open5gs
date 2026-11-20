@@ -382,6 +382,19 @@ void sgwc_s11_handle_create_session_request(
                             s5_s8_u_sgw_f_teid.data;
             ul_tunnel->remote_teid = be32toh(pgw_s5u_teid->teid);
 
+            /*
+             * The PGW-U is known already (SGW relocation: S1 handover, X2
+             * path switch, TAU), so no S5 Create Session Response follows
+             * to complete the UL PDR: strip the S1-U GTP-U header before
+             * re-encapsulating towards the PGW, as
+             * sgwc_s5c_handle_create_session_response() does otherwise.
+             */
+            if (ul_tunnel->pdr) {
+                ul_tunnel->pdr->outer_header_removal_len = 1;
+                ul_tunnel->pdr->outer_header_removal.description =
+                    OGS_PFCP_OUTER_HEADER_REMOVAL_GTPU_UDP_IP;
+            }
+
             rv = ogs_gtp2_f_teid_to_ip(pgw_s5u_teid, &ul_tunnel->remote_ip);
             if (rv != OGS_OK) {
                 ogs_error("No IPv4 or IPv6 in PGW-S5U(UL)");

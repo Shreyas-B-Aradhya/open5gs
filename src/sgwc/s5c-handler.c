@@ -364,12 +364,28 @@ void sgwc_s5c_handle_modify_bearer_response(
     rv = ogs_gtp_xact_commit(s5c_xact);
     ogs_expect(rv == OGS_OK);
 
+    modify_action = s5c_xact->modify_action;
+
+    /* S1HO path switch: the S11 transaction is kept on the UE */
+    if (modify_action == OGS_GTP_MODIFY_IN_S1_HANDOVER_SGW_RELOCATION &&
+        sess) {
+        sgwc_ue = sgwc_ue_find_by_id(sess->sgwc_ue_id);
+        if (sgwc_ue)
+            s11_xact = ogs_gtp_xact_find_by_id(sgwc_ue->s1ho_s11_xact_id);
+    }
+
     if (!s11_xact) {
         ogs_error("No S11 Transaction (assoc_xact_id=%u)",
                 s5c_xact->assoc_xact_id);
+        if (sgwc_ue &&
+            modify_action == OGS_GTP_MODIFY_IN_S1_HANDOVER_SGW_RELOCATION) {
+            if (sess)
+                sess->s1ho_s5_pending = false;
+            if (sgwc_ue->s1ho_s5_outstanding > 0)
+                sgwc_ue->s1ho_s5_outstanding--;
+        }
         return;
     }
-    modify_action = s5c_xact->modify_action;
 
     /************************
      * Getting Cause Value
@@ -378,6 +394,65 @@ void sgwc_s5c_handle_modify_bearer_response(
         ogs_gtp2_cause_t *cause = rsp->cause.data;
         ogs_assert(cause);
         session_cause = cause->value;
+    }
+
+    /*
+     * S1 handover with SGW relocation (step 16a): one answer per relocated
+     * session; the MME gets one Modify Bearer Response after the last.
+     */
+    if (modify_action == OGS_GTP_MODIFY_IN_S1_HANDOVER_SGW_RELOCATION) {
+        ogs_gtp2_message_t send_message;
+        ogs_gtp2_cause_t cause;
+
+        if (sess) {
+            sess->s1ho_s5_pending = false;
+            sgwc_ue = sgwc_ue_find_by_id(sess->sgwc_ue_id);
+        }
+        if (!sgwc_ue) {
+            ogs_error("S1HO: Modify Bearer Response without UE context");
+            ogs_gtp_send_error_message(s11_xact, 0,
+                    OGS_GTP2_MODIFY_BEARER_RESPONSE_TYPE,
+                    OGS_GTP2_CAUSE_CONTEXT_NOT_FOUND);
+            return;
+        }
+
+        if (session_cause != OGS_GTP2_CAUSE_REQUEST_ACCEPTED) {
+            ogs_error("S1HO: PGW refused the S5 path switch [Cause:%d]",
+                    session_cause);
+            sgwc_ue->s1ho_s5_cause = session_cause ? session_cause :
+                OGS_GTP2_CAUSE_SYSTEM_FAILURE;
+        } else {
+            ogs_info("    S1HO: S5 path switched SGW_S5C_TEID[0x%x] "
+                    "PGW_S5C_TEID[0x%x]",
+                    sess->sgw_s5c_teid, sess->pgw_s5c_teid);
+        }
+
+        if (--sgwc_ue->s1ho_s5_outstanding > 0)
+            return;
+
+        memset(&send_message, 0, sizeof(ogs_gtp2_message_t));
+        memset(&cause, 0, sizeof(cause));
+        cause.value = sgwc_ue->s1ho_s5_cause;
+        send_message.modify_bearer_response.cause.presence = 1;
+        send_message.modify_bearer_response.cause.data = &cause;
+        send_message.modify_bearer_response.cause.len = sizeof(cause);
+        send_message.h.type = OGS_GTP2_MODIFY_BEARER_RESPONSE_TYPE;
+        send_message.h.teid = sgwc_ue->mme_s11_teid;
+
+        pkbuf = ogs_gtp2_build_msg(&send_message);
+        if (!pkbuf) {
+            ogs_error("ogs_gtp2_build_msg() failed");
+            return;
+        }
+        rv = ogs_gtp_xact_update_tx(s11_xact, &send_message.h, pkbuf);
+        if (rv != OGS_OK) {
+            ogs_error("ogs_gtp_xact_update_tx() failed");
+            return;
+        }
+        sgwc_ue->s1ho_s11_xact_id = OGS_INVALID_POOL_ID;
+        rv = ogs_gtp_xact_commit(s11_xact);
+        ogs_expect(rv == OGS_OK);
+        return;
     }
 
     /************************

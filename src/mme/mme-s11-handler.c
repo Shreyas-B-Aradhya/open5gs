@@ -31,6 +31,7 @@
 
 #include "mme-s11-build.h"
 #include "mme-s11-handler.h"
+#include "mme-s10-handler.h"
 
 static uint8_t esm_cause_from_gtp(uint8_t gtp_cause)
 {
@@ -182,6 +183,13 @@ static void mme_s11_create_session_fail(
 
     ogs_assert(mme_ue);
 
+    if (create_action == OGS_GTP_CREATE_IN_S10_HANDOVER) {
+        /* Never release towards the PGW here: it serves the source side */
+        mme_s10_target_fail(mme_ue, OGS_GTP2_CAUSE_RELOCATION_FAILURE,
+                reason ? reason : "Create Session Response failure");
+        return;
+    }
+
     if (reason)
         ogs_error("[%s] CreateSessionResponse failure: %s [Cause:%d]",
                 mme_ue->imsi_bcd, reason, fail_cause);
@@ -331,6 +339,9 @@ void mme_s11_handle_create_session_response(
     switch (create_action) {
     case OGS_GTP_CREATE_IN_PATH_SWITCH_REQUEST:
         /* No need for PAA or S5C TEID in PathSwitchRequest */
+        break;
+    case OGS_GTP_CREATE_IN_S10_HANDOVER:
+        /* PAA and PGW S5C F-TEID came from the source MME */
         break;
     case OGS_GTP_CREATE_IN_TRACKING_AREA_UPDATE:
         /* 2G->4G mobility: PAA/S5C TEID may already exist from SGSN */
@@ -587,6 +598,11 @@ void mme_s11_handle_create_session_response(
                 bearer, create_action);
         ogs_expect(r == OGS_OK);
         ogs_assert(r != OGS_ERROR);
+    } else if (create_action == OGS_GTP_CREATE_IN_S10_HANDOVER) {
+
+        /* Step 4a: next PDN, or step 5 once every PDN is set up */
+        mme_s10_target_session_created(enb_ue, mme_ue);
+
     } else if (create_action == OGS_GTP_CREATE_IN_PATH_SWITCH_REQUEST) {
 
         GTP_COUNTER_CHECK(mme_ue, GTP_COUNTER_CREATE_SESSION_BY_PATH_SWITCH,
@@ -732,6 +748,10 @@ void mme_s11_handle_modify_bearer_response(
         ogs_expect(r == OGS_OK);
         ogs_assert(r != OGS_ERROR);
         break;
+    case OGS_GTP_MODIFY_IN_S10_HANDOVER:
+        /* S10 relocation, step 16 done */
+        mme_s10_target_handover_complete(enb_ue, mme_ue);
+        break;
     default:
         break;
     }
@@ -834,6 +854,15 @@ void mme_s11_handle_delete_session_response(
 
     ogs_debug("    MME_S11_TEID[%d] SGW_S11_TEID[%d]",
             mme_ue->mme_s11_teid, source_ue->sgw_s11_teid);
+
+    if (action == OGS_GTP_DELETE_IN_S10_HANDOVER) {
+        /* Failed S10 relocation: remove the target context at the end.
+         * mme_ue_remove() clears the sessions, so nothing else here. */
+        GTP_COUNTER_CHECK(mme_ue, GTP_COUNTER_DELETE_SESSION_BY_S10_HANDOVER,
+            mme_s10_target_cleanup_done(mme_ue);
+        );
+        return;
+    }
 
     if (action == OGS_GTP_DELETE_NO_ACTION) {
         /* No Action to be taken after sessions are deleted during
@@ -1796,6 +1825,25 @@ void mme_s11_handle_create_indirect_data_forwarding_tunnel_response(
         ogs_error("MME-UE Context has already been removed");
         return;
     }
+
+    /* Target side of an S10 relocation: step 6a */
+    if (MME_S10_IS_TARGET(mme_ue)) {
+        mme_s10_handle_create_indirect_data_forwarding_tunnel_response(
+                mme_ue, mme_ue_from_teid, rsp);
+        return;
+    }
+
+    /*
+     * Source side of an S10 relocation: step 8a. The intra-MME failure
+     * handling below would delete the UE's sessions; the S10 one sends
+     * a Handover Preparation Failure instead.
+     */
+    if (mme_ue->s10.state == MME_S10_SRC_FORWARDING) {
+        mme_s10_source_handle_create_indirect_data_forwarding_tunnel_response(
+                source_ue, mme_ue, mme_ue_from_teid, rsp);
+        return;
+    }
+
     if (!source_ue) {
         ogs_error("ENB(Source)-S1 Context has already been removed");
         return;

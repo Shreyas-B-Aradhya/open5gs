@@ -30,6 +30,7 @@
 #include "mme-s11-build.h"
 #include "s1ap-build.h"
 #include "s1ap-handler.h"
+#include "mme-s10-handler.h"
 
 #include "mme-path.h"
 #include "mme-sm.h"
@@ -2261,6 +2262,10 @@ void s1ap_handle_ue_context_release_action(enb_ue_t *enb_ue)
             ogs_error("No UE(mme-ue) context");
 
         enb_ue_remove(enb_ue);
+
+        /* Source side of a completed S10 relocation: sessions go now */
+        if (mme_ue && mme_ue->s10.state == MME_S10_SRC_COMPLETING)
+            mme_s10_source_release_sessions(mme_ue);
         break;
     case S1AP_UE_CTX_REL_UE_CONTEXT_REMOVE:
         ogs_debug("    Action: UE context remove");
@@ -3301,6 +3306,115 @@ void s1ap_handle_enb_configuration_transfer(
     }
 }
 
+/*
+ * Handover to a target eNB that is not served by this MME: relocate the UE
+ * to a peer MME over S10 (TS 23.401 5.5.1.2.2, steps 2 and 3).
+ *
+ * STEP 1: only forwards the request to the peer MME. The peer is the first
+ * entry of mme.s10 in the configuration. Selecting among several peers from
+ * the target TAI is not implemented yet.
+ */
+static void s1ap_handle_handover_required_s10(enb_ue_t *source_ue,
+                mme_ue_t *mme_ue, S1AP_Cause_t *Cause, S1AP_TargetID_t *TargetID,
+                S1AP_Source_ToTarget_TransparentContainer_t *Container,
+                uint32_t target_enb_id)
+{
+    int r;
+    char buf[OGS_ADDRSTRLEN];
+    mme_s10_peer_t *peer = NULL;
+    S1AP_TargeteNB_ID_t *targeteNB_ID = NULL;
+    S1AP_Global_ENB_ID_t *Global_ENB_ID = NULL;
+    S1AP_TAI_t *selected_TAI = NULL;
+    ogs_plmn_id_t plmn_id;
+    ogs_gtp2_target_identification_t target;
+    ogs_gtp2_f_cause_t f_cause;
+
+    ogs_assert(source_ue);
+    ogs_assert(mme_ue);
+    ogs_assert(Cause);
+    ogs_assert(TargetID);
+    ogs_assert(Container);
+
+    peer = ogs_list_first(&mme_self()->s10_list);
+    ogs_assert(peer);
+    if (ogs_list_count(&mme_self()->s10_list) > 1)
+        ogs_warn("Multiple S10 peers configured; using the first one");
+
+    targeteNB_ID = TargetID->choice.targeteNB_ID;
+    ogs_assert(targeteNB_ID);
+    Global_ENB_ID = &targeteNB_ID->global_ENB_ID;
+    selected_TAI = &targeteNB_ID->selected_TAI;
+
+    memset(&target, 0, sizeof(target));
+    switch (Global_ENB_ID->eNB_ID.present) {
+    case S1AP_ENB_ID_PR_macroENB_ID:
+        target.target_type = OGS_GTP2_TARGET_TYPE_MACRO_ENODEB_ID;
+        break;
+    case S1AP_ENB_ID_PR_homeENB_ID:
+        target.target_type = OGS_GTP2_TARGET_TYPE_HOME_ENODEB_ID;
+        break;
+    default:
+        ogs_error("Unsupported target eNB-ID type[%d]",
+                Global_ENB_ID->eNB_ID.present);
+        goto failure;
+    }
+
+    if (Global_ENB_ID->pLMNidentity.size != sizeof(plmn_id) ||
+        selected_TAI->tAC.size != 2) {
+        ogs_error("Invalid target PLMN[%d] or TAC[%d] size",
+                (int)Global_ENB_ID->pLMNidentity.size,
+                (int)selected_TAI->tAC.size);
+        goto failure;
+    }
+    memcpy(&plmn_id, Global_ENB_ID->pLMNidentity.buf, sizeof(plmn_id));
+    ogs_nas_from_plmn_id(&target.nas_plmn_id, &plmn_id);
+    target.enodeb_id = target_enb_id;
+    target.tac = (selected_TAI->tAC.buf[0] << 8) | selected_TAI->tAC.buf[1];
+
+    memset(&f_cause, 0, sizeof(f_cause));
+    switch (Cause->present) {
+    case S1AP_Cause_PR_radioNetwork:
+        f_cause.cause_type = OGS_GTP2_F_CAUSE_TYPE_RADIO_NETWORK_LAYER;
+        f_cause.value = Cause->choice.radioNetwork;
+        break;
+    case S1AP_Cause_PR_transport:
+        f_cause.cause_type = OGS_GTP2_F_CAUSE_TYPE_TRANSPORT_LAYER;
+        f_cause.value = Cause->choice.transport;
+        break;
+    case S1AP_Cause_PR_nas:
+        f_cause.cause_type = OGS_GTP2_F_CAUSE_TYPE_NAS;
+        f_cause.value = Cause->choice.nas;
+        break;
+    case S1AP_Cause_PR_protocol:
+        f_cause.cause_type = OGS_GTP2_F_CAUSE_TYPE_PROTOCOL;
+        f_cause.value = Cause->choice.protocol;
+        break;
+    default:
+        f_cause.cause_type = OGS_GTP2_F_CAUSE_TYPE_MISCELLANEOUS;
+        f_cause.value = Cause->choice.misc;
+        break;
+    }
+
+    ogs_info("Handover required : target eNB-id[0x%x] is not served by "
+            "this MME, forwarding to S10 peer MME[%s]",
+            target_enb_id, OGS_ADDR(peer->gnode.sa_list, buf));
+
+    r = mme_gtp_send_forward_relocation_request(source_ue, mme_ue, peer,
+            &target, &f_cause, Container->buf, Container->size);
+    if (r != OGS_OK) {
+        ogs_error("mme_gtp_send_forward_relocation_request() failed");
+        goto failure;
+    }
+    return;
+
+failure:
+    r = s1ap_send_handover_preparation_failure(source_ue,
+            S1AP_Cause_PR_radioNetwork,
+            S1AP_CauseRadioNetwork_ho_failure_in_target_EPC_eNB_or_target_system);
+    ogs_expect(r == OGS_OK);
+    ogs_assert(r != OGS_ERROR);
+}
+
 static void s1ap_handle_handover_required_intralte(enb_ue_t *source_ue,
                 S1AP_Cause_t *Cause, S1AP_TargetID_t *TargetID,
                 S1AP_Source_ToTarget_TransparentContainer_t *Source_ToTarget_TransparentContainer)
@@ -3331,7 +3445,7 @@ static void s1ap_handle_handover_required_intralte(enb_ue_t *source_ue,
     }
 
     target_enb = mme_enb_find_by_enb_id(target_enb_id);
-    if (target_enb == NULL) {
+    if (target_enb == NULL && !mme_s10_is_enabled()) {
         ogs_error("Handover required : cannot find target eNB-id[0x%x]",
                     target_enb_id);
         r = s1ap_send_handover_preparation_failure(source_ue,
@@ -3377,8 +3491,35 @@ static void s1ap_handle_handover_required_intralte(enb_ue_t *source_ue,
 
     source_ue->handover_type = S1AP_HandoverType_intralte;
 
+    /*
+     * Fresh {NH, NCC} for the target eNB (TS 33.401 7.2.8.4.3). Also on the
+     * S10 path: the pair travels to the target MME in the MM Context.
+     */
     mme_ue->nhcc++;
     ogs_kdf_nh_enb(mme_ue->kasme, mme_ue->nh, mme_ue->nh);
+
+    if (MME_S10_IS_TARGET(mme_ue) || mme_ue->s10.state ==
+            MME_S10_SRC_COMPLETING) {
+        /*
+         * The previous S10 relocation of this UE is not finished (e.g. the
+         * PGW path switch of step 16 is pending): a new handover now would
+         * mix the two procedures.
+         */
+        ogs_warn("[%s] Handover Required during S10 relocation state[%d]: "
+                "rejected", mme_ue->imsi_bcd, mme_ue->s10.state);
+        r = s1ap_send_handover_preparation_failure(source_ue,
+                S1AP_Cause_PR_radioNetwork,
+                S1AP_CauseRadioNetwork_unspecified);
+        ogs_expect(r == OGS_OK);
+        return;
+    }
+
+    if (target_enb == NULL) {
+        /* Target eNB belongs to another MME: relocate via S10 */
+        s1ap_handle_handover_required_s10(source_ue, mme_ue, Cause, TargetID,
+                Source_ToTarget_TransparentContainer, target_enb_id);
+        return;
+    }
 
     r = s1ap_send_handover_request(
             source_ue, target_enb, &source_ue->handover_type, Cause,
@@ -3656,6 +3797,11 @@ void s1ap_handle_handover_request_ack(
         return;
     }
 
+    /* Target side of an S10 inter-MME relocation: no source S1 context */
+    if (mme_s10_handle_handover_request_ack(target_ue, *ENB_UE_S1AP_ID,
+                E_RABAdmittedList, Target_ToSource_TransparentContainer))
+        return;
+
     source_ue = enb_ue_find_by_id(target_ue->source_ue_id);
     if (!source_ue) {
         ogs_error("No Source UE");
@@ -3923,6 +4069,10 @@ void s1ap_handle_handover_failure(mme_enb_t *enb, ogs_s1ap_message_t *message)
         return;
     }
 
+    /* Target side of an S10 inter-MME relocation */
+    if (mme_s10_handle_handover_failure(target_ue))
+        return;
+
     source_ue = enb_ue_find_by_id(target_ue->source_ue_id);
     if (!source_ue) {
         ogs_error("No Source UE");
@@ -4043,6 +4193,33 @@ void s1ap_handle_handover_cancel(mme_enb_t *enb, ogs_s1ap_message_t *message)
         ogs_expect(r == OGS_OK);
         ogs_assert(r != OGS_ERROR);
         return;
+    }
+
+    /*
+     * Source side of an S10 relocation: there is no local target context.
+     * Remove the indirect tunnels on the source SGW, then acknowledge
+     * (the response handler sends Handover Cancel Acknowledge). The target
+     * MME keeps its context until Relocation Cancel is implemented.
+     */
+    {
+        mme_ue_t *s10_mme_ue = mme_ue_find_by_id(source_ue->mme_ue_id);
+        if (s10_mme_ue &&
+            (s10_mme_ue->s10.state == MME_S10_SRC_FORWARDING ||
+             s10_mme_ue->s10.state == MME_S10_SRC_PREPARED)) {
+            ogs_warn("[%s] Handover Cancel during S10 relocation",
+                    s10_mme_ue->imsi_bcd);
+            s10_mme_ue->s10.state = MME_S10_NONE;
+            if (mme_ue_have_indirect_tunnel(s10_mme_ue) == true) {
+                r = mme_gtp_send_delete_indirect_data_forwarding_tunnel_request(
+                        source_ue, s10_mme_ue,
+                        OGS_GTP_DELETE_INDIRECT_HANDOVER_CANCEL);
+                ogs_expect(r == OGS_OK);
+            } else {
+                r = s1ap_send_handover_cancel_ack(source_ue);
+                ogs_expect(r == OGS_OK);
+            }
+            return;
+        }
     }
 
     target_ue = enb_ue_find_by_id(source_ue->target_ue_id);
@@ -4172,6 +4349,11 @@ void s1ap_handle_enb_status_transfer(
         ogs_assert(r != OGS_ERROR);
         return;
     }
+
+    /* Source side of an S10 relocation: forward over S10 (step 10) */
+    if (mme_s10_handle_enb_status_transfer(source_ue,
+                ENB_StatusTransfer_TransparentContainer))
+        return;
 
     target_ue = enb_ue_find_by_id(source_ue->target_ue_id);
     if (!target_ue) {
@@ -4308,6 +4490,10 @@ void s1ap_handle_handover_notification(
         ogs_assert(r != OGS_ERROR);
         return;
     }
+
+    /* Target side of an S10 inter-MME relocation */
+    if (mme_s10_handle_handover_notify(target_ue, TAI, EUTRAN_CGI))
+        return;
 
     source_ue = enb_ue_find_by_id(target_ue->source_ue_id);
     if (!source_ue) {

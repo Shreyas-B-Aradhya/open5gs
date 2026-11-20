@@ -217,6 +217,20 @@ mme:
 ################################################################################
 # 3GPP Specification
 ################################################################################
+#  o S10 (inter-MME, GTPv2-C): peer MMEs, each mapping a GUMMEI to an address.
+#    Disabled unless at least one peer is listed. The peer is found from the
+#    GUMMEI inside the GUTI sent by the UE. `port` (default: GTPv2-C port)
+#    and `family` are optional.
+#  mme:
+#    s10:
+#      - address: 127.0.0.12
+#        plmn_id:
+#          mcc: 999
+#          mnc: 70
+#        mme_gid: 2
+#        mme_code: 2
+#
+################################################################################
 #  o GUMMEI
 #  gummei:
 #    - plmn_id:

@@ -2244,6 +2244,8 @@ ogs_pkbuf_t *s1ap_build_handover_request(
         *Source_ToTarget_TransparentContainer = NULL;
     S1AP_UESecurityCapabilities_t *UESecurityCapabilities = NULL;
     S1AP_SecurityContext_t *SecurityContext = NULL;
+    S1AP_HandoverRestrictionList_t *HandoverRestrictionList = NULL;
+    S1AP_GUMMEI_t *GUMMEI = NULL;
     S1AP_Masked_IMEISV_t *Masked_IMEISV = NULL;
 
     mme_ue_t *mme_ue = NULL;
@@ -2341,6 +2343,20 @@ ogs_pkbuf_t *s1ap_build_handover_request(
 
     UESecurityCapabilities = &ie->value.choice.UESecurityCapabilities;
 
+    /*
+     * Handover Restriction List (TS 36.413 9.1.5.4): the serving PLMN, as
+     * other MMEs send it. Some eNBs rely on it after the handover.
+     */
+    ie = CALLOC(1, sizeof(S1AP_HandoverRequestIEs_t));
+    ASN_SEQUENCE_ADD(&HandoverRequest->protocolIEs, ie);
+
+    ie->id = S1AP_ProtocolIE_ID_id_HandoverRestrictionList;
+    ie->criticality = S1AP_Criticality_ignore;
+    ie->value.present =
+        S1AP_HandoverRequestIEs__value_PR_HandoverRestrictionList;
+
+    HandoverRestrictionList = &ie->value.choice.HandoverRestrictionList;
+
     ie = CALLOC(1, sizeof(S1AP_HandoverRequestIEs_t));
     ASN_SEQUENCE_ADD(&HandoverRequest->protocolIEs, ie);
 
@@ -2349,6 +2365,18 @@ ogs_pkbuf_t *s1ap_build_handover_request(
     ie->value.present = S1AP_HandoverRequestIEs__value_PR_SecurityContext;
 
     SecurityContext = &ie->value.choice.SecurityContext;
+
+    /* GUMMEI ID (TS 36.413 9.1.5.4): the MME now serving the UE */
+    if (mme_self()->num_of_served_gummei > 0) {
+        ie = CALLOC(1, sizeof(S1AP_HandoverRequestIEs_t));
+        ASN_SEQUENCE_ADD(&HandoverRequest->protocolIEs, ie);
+
+        ie->id = S1AP_ProtocolIE_ID_id_GUMMEI_ID;
+        ie->criticality = S1AP_Criticality_ignore;
+        ie->value.present = S1AP_HandoverRequestIEs__value_PR_GUMMEI;
+
+        GUMMEI = &ie->value.choice.GUMMEI;
+    }
 
     *MME_UE_S1AP_ID = target_ue->mme_ue_s1ap_id;
     *HandoverType = *handovertype;
@@ -2498,6 +2526,18 @@ ogs_pkbuf_t *s1ap_build_handover_request(
     SecurityContext->nextHopParameter.bits_unused = 0;
     memcpy(SecurityContext->nextHopParameter.buf,
             mme_ue->nh, SecurityContext->nextHopParameter.size);
+
+    ogs_asn_buffer_to_OCTET_STRING(&mme_ue->tai.plmn_id, OGS_PLMN_ID_LEN,
+            &HandoverRestrictionList->servingPLMN);
+
+    if (GUMMEI) {
+        served_gummei_t *served = &mme_self()->served_gummei[0];
+        ogs_asn_buffer_to_OCTET_STRING(&served->plmn_id[0], OGS_PLMN_ID_LEN,
+                &GUMMEI->pLMN_Identity);
+        ogs_asn_uint16_to_OCTET_STRING(served->mme_gid[0],
+                &GUMMEI->mME_Group_ID);
+        ogs_asn_uint8_to_OCTET_STRING(served->mme_code[0], &GUMMEI->mME_Code);
+    }
 
     /* TS23.003 6.2.2 Composition of IMEISV
      *

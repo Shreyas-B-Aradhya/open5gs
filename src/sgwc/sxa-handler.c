@@ -347,6 +347,32 @@ void sgwc_sxa_handle_session_establishment_response(
         indication = create_session_request->indication_flags.data;
     }
 
+    /*
+     * S1 handover with SGW relocation, TS 23.401 5.5.1.2.2 step 4:
+     * the MME relocates an existing PDN connection (the PGW S5/S8-C
+     * F-TEID carries the PGW's TEID and the bearers their PGW S5/S8-U
+     * F-TEID) without Operation Indication. The PGW is not contacted
+     * now: the S5 path is switched by the Modify Bearer Request that
+     * follows the Handover Notify (step 16). Answer the MME directly.
+     */
+    if (!(indication && indication->operation_indication) &&
+        pgw_s5c_teid->teid != 0 &&
+        create_session_request->bearer_contexts_to_be_created[0].presence &&
+        create_session_request->bearer_contexts_to_be_created[0].
+            s5_s8_u_sgw_f_teid.presence) {
+
+        sess->pgw_s5c_teid = be32toh(pgw_s5c_teid->teid);
+        sess->s1ho_s5_pending = true;
+
+        ogs_info("    S1 handover with SGW relocation: PGW_S5C_TEID[0x%x], "
+                "S5 left untouched until Modify Bearer",
+                sess->pgw_s5c_teid);
+
+        ogs_assert(OGS_OK ==
+            sgwc_gtp_send_create_session_response(sess, s11_xact));
+        return;
+    }
+
     if (indication && indication->operation_indication) {
         ogs_gtp2_message_t send_message;
         ogs_gtp2_modify_bearer_request_t *modify_bearer_request =
@@ -456,6 +482,126 @@ void sgwc_sxa_handle_session_establishment_response(
 
     rv = ogs_gtp_xact_commit(s5c_xact);
     ogs_expect(rv == OGS_OK);
+}
+
+/*
+ * S1 handover with SGW relocation, TS 23.401 5.5.1.2.2 step 16a: the MME's
+ * Modify Bearer Request (after Handover Notify) has updated the eNB side;
+ * now switch the S5 path of every relocated session to this SGW. The
+ * Modify Bearer Response goes to the MME once the PGW answered them all
+ * (sgwc_s5c_handle_modify_bearer_response()).
+ * Returns the number of S5 requests sent.
+ */
+static int send_s1ho_s5_modify_bearer_requests(
+        sgwc_ue_t *sgwc_ue, ogs_gtp_xact_t *s11_xact)
+{
+    int rv, n = 0;
+    sgwc_sess_t *sess = NULL;
+
+    ogs_list_for_each(&sgwc_ue->sess_list, sess) {
+        int i, len;
+        ogs_gtp2_message_t send_message;
+        ogs_gtp2_modify_bearer_request_t *req =
+            &send_message.modify_bearer_request;
+        ogs_gtp2_f_teid_t sgw_s5c_teid;
+        ogs_gtp2_f_teid_t sgw_s5u_teid[OGS_BEARER_PER_UE];
+        int sgw_s5u_len[OGS_BEARER_PER_UE];
+        sgwc_bearer_t *bearer = NULL;
+        ogs_pkbuf_t *pkbuf = NULL;
+        ogs_gtp_xact_t *s5c_xact = NULL;
+
+        if (!sess->s1ho_s5_pending)
+            continue;
+        if (!sess->gnode) {
+            ogs_error("    S1HO: no PGW node for session");
+            continue;
+        }
+
+        memset(&send_message, 0, sizeof(ogs_gtp2_message_t));
+        send_message.h.type = OGS_GTP2_MODIFY_BEARER_REQUEST_TYPE;
+        send_message.h.teid = sess->pgw_s5c_teid;
+
+        /* Sender F-TEID: this SGW's S5-C */
+        memset(&sgw_s5c_teid, 0, sizeof(ogs_gtp2_f_teid_t));
+        sgw_s5c_teid.interface_type = OGS_GTP2_F_TEID_S5_S8_SGW_GTP_C;
+        sgw_s5c_teid.teid = htobe32(sess->sgw_s5c_teid);
+        rv = ogs_gtp2_sockaddr_to_f_teid(
+                ogs_gtp_self()->gtpc_addr, ogs_gtp_self()->gtpc_addr6,
+                &sgw_s5c_teid, &len);
+        if (rv != OGS_OK) {
+            ogs_error("    S1HO: no GTP-C address");
+            continue;
+        }
+        req->sender_f_teid_for_control_plane.presence = 1;
+        req->sender_f_teid_for_control_plane.data = &sgw_s5c_teid;
+        req->sender_f_teid_for_control_plane.len = len;
+
+        /* Per bearer: this SGW's S5-U F-TEID (same IE as path switch) */
+        i = 0;
+        ogs_list_for_each(&sess->bearer_list, bearer) {
+            sgwc_tunnel_t *dl_tunnel = sgwc_dl_tunnel_in_bearer(bearer);
+
+            if (i >= OGS_BEARER_PER_UE)
+                break;
+            if (!dl_tunnel ||
+                (!dl_tunnel->local_addr && !dl_tunnel->local_addr6))
+                continue;
+
+            memset(&sgw_s5u_teid[i], 0, sizeof(ogs_gtp2_f_teid_t));
+            sgw_s5u_teid[i].teid = htobe32(dl_tunnel->local_teid);
+            sgw_s5u_teid[i].interface_type = dl_tunnel->interface_type;
+            rv = ogs_gtp2_sockaddr_to_f_teid(
+                    dl_tunnel->local_addr, dl_tunnel->local_addr6,
+                    &sgw_s5u_teid[i], &sgw_s5u_len[i]);
+            if (rv != OGS_OK)
+                continue;
+
+            req->bearer_contexts_to_be_modified[i].presence = 1;
+            req->bearer_contexts_to_be_modified[i].eps_bearer_id.presence = 1;
+            req->bearer_contexts_to_be_modified[i].eps_bearer_id.u8 =
+                bearer->ebi;
+            req->bearer_contexts_to_be_modified[i].s4_u_sgsn_f_teid.presence =
+                1;
+            req->bearer_contexts_to_be_modified[i].s4_u_sgsn_f_teid.data =
+                &sgw_s5u_teid[i];
+            req->bearer_contexts_to_be_modified[i].s4_u_sgsn_f_teid.len =
+                sgw_s5u_len[i];
+            i++;
+        }
+
+        pkbuf = ogs_gtp2_build_msg(&send_message);
+        if (!pkbuf) {
+            ogs_error("ogs_gtp2_build_msg() failed");
+            continue;
+        }
+
+        s5c_xact = ogs_gtp_xact_local_create(
+                sess->gnode, &send_message.h, pkbuf, sess_timeout,
+                OGS_UINT_TO_POINTER(sess->id));
+        if (!s5c_xact) {
+            ogs_error("ogs_gtp_xact_local_create() failed");
+            continue;
+        }
+        s5c_xact->local_teid = sess->sgw_s5c_teid;
+        s5c_xact->modify_action = OGS_GTP_MODIFY_IN_S1_HANDOVER_SGW_RELOCATION;
+        /*
+         * Several S5 requests answer one S11 request: the S11 transaction
+         * is kept on the UE (ogs_gtp_xact_associate() is one-to-one).
+         */
+
+        rv = ogs_gtp_xact_commit(s5c_xact);
+        ogs_expect(rv == OGS_OK);
+
+        ogs_info("    S1HO: Modify Bearer Request to PGW (S5 path switch) "
+                "SGW_S5C_TEID[0x%x] PGW_S5C_TEID[0x%x] bearers[%d]",
+                sess->sgw_s5c_teid, sess->pgw_s5c_teid, i);
+        n++;
+    }
+
+    sgwc_ue->s1ho_s5_outstanding = n;
+    sgwc_ue->s1ho_s5_cause = OGS_GTP2_CAUSE_REQUEST_ACCEPTED;
+    sgwc_ue->s1ho_s11_xact_id = n ? s11_xact->id : OGS_INVALID_POOL_ID;
+    return n;
 }
 
 void sgwc_sxa_handle_session_modification_response(
@@ -1160,7 +1306,14 @@ void sgwc_sxa_handle_session_modification_response(
                     indication = gtp_req->indication_flags.data;
                 }
 
-                if (indication && indication->handover_indication) {
+                /*
+                 * S1 handover with SGW relocation: the eNB side is updated,
+                 * now the S5 path (step 16a). The MBR Response follows the
+                 * PGW's answers.
+                 */
+                if (send_s1ho_s5_modify_bearer_requests(sgwc_ue, s11_xact)) {
+                    /* answered in sgwc_s5c_handle_modify_bearer_response() */
+                } else if (indication && indication->handover_indication) {
                     recv_message->h.type = OGS_GTP2_MODIFY_BEARER_REQUEST_TYPE;
                     recv_message->h.teid = sess->pgw_s5c_teid;
 
